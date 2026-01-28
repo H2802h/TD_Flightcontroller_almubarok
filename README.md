@@ -1055,7 +1055,7 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 ---
 
 ## 🙏 Acknowledgments
-
+- ** AL-MUBAROK-TD ** UMY
 - **Teensy Community** for excellent hardware and support
 - **Madgwick** for the AHRS algorithm
 - **Arduino/Teensyduino** team
