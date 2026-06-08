@@ -4,7 +4,8 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-active%20development-green.svg)]()
 
-Advanced quadcopter flight controller based on Teensy 4.0 with GPS loiter, altitude hold, RTL, and real-time telemetry system.
+fully
+slopy ai program  quadcopter flight controller based on Teensy 4.0 with GPS loiter, altitude hold, RTL, and real-time telemetry system.
 
 ---
 
