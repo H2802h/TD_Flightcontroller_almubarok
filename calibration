@@ -1,1 +1,607 @@
 
+#include <Wire.h>
+#include <EEPROM.h>
+
+// MPU9250 I2C addresses
+#define MPU9250_ADDRESS 0x68
+#define AK8963_ADDRESS  0x0C
+
+// Register addresses
+#define PWR_MGMT_1      0x6B
+#define PWR_MGMT_2      0x6C
+#define CONFIG          0x1A
+#define GYRO_CONFIG     0x1B
+#define ACCEL_CONFIG    0x1C
+#define ACCEL_CONFIG2   0x1D
+#define SMPLRT_DIV      0x19
+#define INT_PIN_CFG     0x37
+#define WHO_AM_I        0x75
+
+// Data registers
+#define ACCEL_XOUT_H    0x3B
+#define GYRO_XOUT_H     0x43
+#define MAG_XOUT_L      0x03
+#define MAG_CNTL1       0x0A
+#define MAG_CNTL2       0x0B
+
+// EEPROM addresses untuk menyimpan kalibrasi
+#define EEPROM_ACCEL_OFFSET_X   0
+#define EEPROM_ACCEL_OFFSET_Y   4
+#define EEPROM_ACCEL_OFFSET_Z   8
+#define EEPROM_GYRO_OFFSET_X    12
+#define EEPROM_GYRO_OFFSET_Y    16
+#define EEPROM_GYRO_OFFSET_Z    20
+#define EEPROM_MAG_OFFSET_X     24
+#define EEPROM_MAG_OFFSET_Y     28
+#define EEPROM_MAG_OFFSET_Z     32
+#define EEPROM_MAG_SCALE_X      36
+#define EEPROM_MAG_SCALE_Y      40
+#define EEPROM_MAG_SCALE_Z      44
+#define EEPROM_CALIBRATED_FLAG  48
+
+// Struktur untuk menyimpan offset kalibrasi
+struct CalibrationData {
+  // Offset accelerometer
+  float accel_offset_x, accel_offset_y, accel_offset_z;
+  
+  // Offset gyroscope
+  float gyro_offset_x, gyro_offset_y, gyro_offset_z;
+  
+  // Offset dan scale magnetometer
+  float mag_offset_x, mag_offset_y, mag_offset_z;
+  float mag_scale_x, mag_scale_y, mag_scale_z;
+  
+  bool is_calibrated;
+};
+
+CalibrationData cal_data;
+
+// Scaling factors
+float accel_scale = 2.0 / 32768.0;  // ±2g
+float gyro_scale = 250.0 / 32768.0; // ±250°/s
+float mag_scale = 4912.0 / 32768.0; // ±4912 μT
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000);
+  
+  delay(1000);
+  Serial.println("=== PROGRAM KALIBRASI MPU9250 ===");
+  Serial.println();
+  
+  // Initialize MPU9250
+  if (!initMPU9250()) {
+    Serial.println("Gagal menginisialisasi MPU9250!");
+    while(1);
+  }
+  
+  if (!initMagnetometer()) {
+    Serial.println("Gagal menginisialisasi magnetometer!");
+  }
+  
+  // Load kalibrasi dari EEPROM
+  loadCalibration();
+  
+  showMenu();
+}
+
+void loop() {
+  if (Serial.available()) {
+    char command = Serial.read();
+    
+    switch(command) {
+      case '1':
+        calibrateAccelerometer();
+        break;
+      case '2':
+        calibrateGyroscope();
+        break;
+      case '3':
+        calibrateMagnetometer();
+        break;
+      case '4':
+        fullCalibration();
+        break;
+      case '5':
+        testCalibratedData();
+        break;
+      case '6':
+        resetCalibration();
+        break;
+      case '7':
+        showCalibrationData();
+        break;
+      case 'm':
+      case 'M':
+        showMenu();
+        break;
+      default:
+        Serial.println("Perintah tidak dikenal. Ketik 'm' untuk menu.");
+    }
+  }
+}
+
+void showMenu() {
+  Serial.println("\n=== MENU KALIBRASI ===");
+  Serial.println("1. Kalibrasi Accelerometer");
+  Serial.println("2. Kalibrasi Gyroscope");
+  Serial.println("3. Kalibrasi Magnetometer");
+  Serial.println("4. Kalibrasi Lengkap (Semua)");
+  Serial.println("5. Test Data Terkalibrasi");
+  Serial.println("6. Reset Kalibrasi");
+  Serial.println("7. Tampilkan Data Kalibrasi");
+  Serial.println("m. Tampilkan Menu");
+  Serial.println("\nPilih opsi (1-7 atau m): ");
+}
+
+void calibrateAccelerometer() {
+  Serial.println("\n=== KALIBRASI ACCELEROMETER ===");
+  Serial.println();
+  Serial.println("INSTRUKSI KALIBRASI ACCELEROMETER:");
+  Serial.println("1. Letakkan sensor pada permukaan DATAR dan STABIL");
+  Serial.println("2. Pastikan sumbu Z mengarah ke ATAS (melawan gravitasi)");
+  Serial.println("3. Jangan sentuh atau gerakkan sensor selama kalibrasi");
+  Serial.println("4. Kalibrasi akan mengambil 1000 sampel data");
+  Serial.println();
+  Serial.println("Tekan ENTER untuk memulai kalibrasi...");
+  
+  while(Serial.read() != '\n' && Serial.available() == 0);
+  while(Serial.read() != '\n');
+  
+  Serial.println("Memulai kalibrasi accelerometer...");
+  
+  long sum_x = 0, sum_y = 0, sum_z = 0;
+  int samples = 1000;
+  
+  for(int i = 0; i < samples; i++) {
+    int16_t ax, ay, az;
+    readAccelerometer(&ax, &ay, &az);
+    
+    sum_x += ax;
+    sum_y += ay;
+    sum_z += az;
+    
+    if(i % 100 == 0) {
+      Serial.print("Progress: ");
+      Serial.print((i * 100) / samples);
+      Serial.println("%");
+    }
+    
+    delay(2);
+  }
+  
+  // Hitung offset (untuk Z, offset = raw_value - 1g dalam raw format)
+  cal_data.accel_offset_x = -(float)sum_x / samples;
+  cal_data.accel_offset_y = -(float)sum_y / samples;
+  cal_data.accel_offset_z = -(float)sum_z / samples + (1.0 / accel_scale); // +1g untuk Z
+  
+  Serial.println("Kalibrasi accelerometer selesai!");
+  Serial.println("Offset yang dihitung:");
+  Serial.print("X: "); Serial.println(cal_data.accel_offset_x * accel_scale, 4);
+  Serial.print("Y: "); Serial.println(cal_data.accel_offset_y * accel_scale, 4);
+  Serial.print("Z: "); Serial.println(cal_data.accel_offset_z * accel_scale, 4);
+  
+  saveCalibration();
+}
+
+void calibrateGyroscope() {
+  Serial.println("\n=== KALIBRASI GYROSCOPE ===");
+  Serial.println();
+  Serial.println("INSTRUKSI KALIBRASI GYROSCOPE:");
+  Serial.println("1. Letakkan sensor pada permukaan DATAR dan STABIL");
+  Serial.println("2. Pastikan sensor TIDAK bergerak sama sekali");
+  Serial.println("3. Hindari getaran dari meja atau lingkungan");
+  Serial.println("4. Kalibrasi akan mengambil 2000 sampel data");
+  Serial.println();
+  Serial.println("Tekan ENTER untuk memulai kalibrasi...");
+  
+  while(Serial.read() != '\n' && Serial.available() == 0);
+  while(Serial.read() != '\n');
+  
+  Serial.println("Memulai kalibrasi gyroscope...");
+  
+  long sum_x = 0, sum_y = 0, sum_z = 0;
+  int samples = 2000;
+  
+  for(int i = 0; i < samples; i++) {
+    int16_t gx, gy, gz;
+    readGyroscope(&gx, &gy, &gz);
+    
+    sum_x += gx;
+    sum_y += gy;
+    sum_z += gz;
+    
+    if(i % 200 == 0) {
+      Serial.print("Progress: ");
+      Serial.print((i * 100) / samples);
+      Serial.println("%");
+    }
+    
+    delay(2);
+  }
+  
+  // Hitung offset
+  cal_data.gyro_offset_x = -(float)sum_x / samples;
+  cal_data.gyro_offset_y = -(float)sum_y / samples;
+  cal_data.gyro_offset_z = -(float)sum_z / samples;
+  
+  Serial.println("Kalibrasi gyroscope selesai!");
+  Serial.println("Offset yang dihitung:");
+  Serial.print("X: "); Serial.println(cal_data.gyro_offset_x * gyro_scale, 4);
+  Serial.print("Y: "); Serial.println(cal_data.gyro_offset_y * gyro_scale, 4);
+  Serial.print("Z: "); Serial.println(cal_data.gyro_offset_z * gyro_scale, 4);
+  
+  saveCalibration();
+}
+
+void calibrateMagnetometer() {
+  Serial.println("\n=== KALIBRASI MAGNETOMETER ===");
+  Serial.println();
+  Serial.println("INSTRUKSI KALIBRASI MAGNETOMETER:");
+  Serial.println("1. Kalibrasi ini membutuhkan GERAKAN KHUSUS");
+  Serial.println("2. Anda akan diminta memutar sensor ke SEMUA ARAH");
+  Serial.println("3. Lakukan gerakan FIGURE-8 (angka 8) di udara");
+  Serial.println("4. Putar sensor PERLAHAN ke segala arah selama 30 detik");
+  Serial.println("5. Pastikan semua sumbu (X,Y,Z) mengalami rotasi penuh");
+  Serial.println("6. Hindari benda logam atau magnet di sekitar");
+  Serial.println();
+  Serial.println("Tekan ENTER untuk memulai kalibrasi...");
+  
+  while(Serial.read() != '\n' && Serial.available() == 0);
+  while(Serial.read() != '\n');
+  
+  Serial.println("Memulai kalibrasi magnetometer...");
+  Serial.println("MULAI MEMUTAR SENSOR SEKARANG!");
+  
+  int16_t mag_max[3] = {-32767, -32767, -32767};
+  int16_t mag_min[3] = {32767, 32767, 32767};
+  
+  unsigned long start_time = millis();
+  int samples = 0;
+  
+  while(millis() - start_time < 30000) { // 30 detik
+    int16_t mx, my, mz;
+    if(readMagnetometer(&mx, &my, &mz)) {
+      // Update min/max values
+      if(mx > mag_max[0]) mag_max[0] = mx;
+      if(mx < mag_min[0]) mag_min[0] = mx;
+      if(my > mag_max[1]) mag_max[1] = my;
+      if(my < mag_min[1]) mag_min[1] = my;
+      if(mz > mag_max[2]) mag_max[2] = mz;
+      if(mz < mag_min[2]) mag_min[2] = mz;
+      
+      samples++;
+      
+      // Progress indicator
+      if(samples % 50 == 0) {
+        int progress = ((millis() - start_time) * 100) / 30000;
+        Serial.print("Progress: ");
+        Serial.print(progress);
+        Serial.print("% - Sampel: ");
+        Serial.println(samples);
+      }
+    }
+    delay(20);
+  }
+  
+  Serial.println("STOP! Kalibrasi magnetometer selesai!");
+  
+  // Hitung offset (hard iron correction)
+  cal_data.mag_offset_x = (mag_max[0] + mag_min[0]) / 2.0;
+  cal_data.mag_offset_y = (mag_max[1] + mag_min[1]) / 2.0;
+  cal_data.mag_offset_z = (mag_max[2] + mag_min[2]) / 2.0;
+  
+  // Hitung scale (soft iron correction)
+  float range_x = mag_max[0] - mag_min[0];
+  float range_y = mag_max[1] - mag_min[1];
+  float range_z = mag_max[2] - mag_min[2];
+  float avg_range = (range_x + range_y + range_z) / 3.0;
+  
+  cal_data.mag_scale_x = avg_range / range_x;
+  cal_data.mag_scale_y = avg_range / range_y;
+  cal_data.mag_scale_z = avg_range / range_z;
+  
+  Serial.print("Sampel yang dikumpulkan: "); Serial.println(samples);
+  Serial.println("Hasil kalibrasi magnetometer:");
+  Serial.print("Offset X: "); Serial.println(cal_data.mag_offset_x);
+  Serial.print("Offset Y: "); Serial.println(cal_data.mag_offset_y);
+  Serial.print("Offset Z: "); Serial.println(cal_data.mag_offset_z);
+  Serial.print("Scale X: "); Serial.println(cal_data.mag_scale_x, 4);
+  Serial.print("Scale Y: "); Serial.println(cal_data.mag_scale_y, 4);
+  Serial.print("Scale Z: "); Serial.println(cal_data.mag_scale_z, 4);
+  
+  saveCalibration();
+}
+
+void fullCalibration() {
+  Serial.println("\n=== KALIBRASI LENGKAP ===");
+  Serial.println("Akan melakukan kalibrasi semua sensor secara berurutan.");
+  Serial.println("Ikuti instruksi untuk setiap sensor.");
+  Serial.println();
+  
+  calibrateAccelerometer();
+  delay(2000);
+  
+  calibrateGyroscope();
+  delay(2000);
+  
+  calibrateMagnetometer();
+  
+  Serial.println("\n=== KALIBRASI LENGKAP SELESAI ===");
+  Serial.println("Semua sensor telah dikalibrasi dan disimpan ke EEPROM.");
+}
+
+void testCalibratedData() {
+  Serial.println("\n=== TEST DATA TERKALIBRASI ===");
+  
+  if(!cal_data.is_calibrated) {
+    Serial.println("PERINGATAN: Sensor belum dikalibrasi!");
+    Serial.println("Lakukan kalibrasi terlebih dahulu.");
+    return;
+  }
+  
+  Serial.println("Menampilkan data sensor terkalibrasi selama 10 detik...");
+  Serial.println("Format: Raw | Kalibrasi");
+  
+  unsigned long start_time = millis();
+  
+  while(millis() - start_time < 10000) {
+    // Read raw data
+    int16_t ax, ay, az, gx, gy, gz, mx, my, mz;
+    readAccelerometer(&ax, &ay, &az);
+    readGyroscope(&gx, &gy, &gz);
+    readMagnetometer(&mx, &my, &mz);
+    
+    // Apply calibration
+    float cal_ax = (ax + cal_data.accel_offset_x) * accel_scale;
+    float cal_ay = (ay + cal_data.accel_offset_y) * accel_scale;
+    float cal_az = (az + cal_data.accel_offset_z) * accel_scale;
+    
+    float cal_gx = (gx + cal_data.gyro_offset_x) * gyro_scale;
+    float cal_gy = (gy + cal_data.gyro_offset_y) * gyro_scale;
+    float cal_gz = (gz + cal_data.gyro_offset_z) * gyro_scale;
+    
+    float cal_mx = (mx - cal_data.mag_offset_x) * cal_data.mag_scale_x * mag_scale;
+    float cal_my = (my - cal_data.mag_offset_y) * cal_data.mag_scale_y * mag_scale;
+    float cal_mz = (mz - cal_data.mag_offset_z) * cal_data.mag_scale_z * mag_scale;
+    
+    // Display data
+    Serial.println("--- Accelerometer (g) ---");
+    Serial.print("X: "); Serial.print(ax * accel_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_ax, 3);
+    Serial.print("Y: "); Serial.print(ay * accel_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_ay, 3);
+    Serial.print("Z: "); Serial.print(az * accel_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_az, 3);
+    
+    Serial.println("--- Gyroscope (°/s) ---");
+    Serial.print("X: "); Serial.print(gx * gyro_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_gx, 3);
+    Serial.print("Y: "); Serial.print(gy * gyro_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_gy, 3);
+    Serial.print("Z: "); Serial.print(gz * gyro_scale, 3); 
+    Serial.print(" | "); Serial.println(cal_gz, 3);
+    
+    Serial.println("--- Magnetometer (μT) ---");
+    Serial.print("X: "); Serial.print(mx * mag_scale, 1); 
+    Serial.print(" | "); Serial.println(cal_mx, 1);
+    Serial.print("Y: "); Serial.print(my * mag_scale, 1); 
+    Serial.print(" | "); Serial.println(cal_my, 1);
+    Serial.print("Z: "); Serial.print(mz * mag_scale, 1); 
+    Serial.print(" | "); Serial.println(cal_mz, 1);
+    
+    Serial.println("------------------------");
+    delay(1000);
+  }
+}
+
+void resetCalibration() {
+  Serial.println("\n=== RESET KALIBRASI ===");
+  Serial.println("Apakah Anda yakin ingin mereset semua data kalibrasi? (y/n)");
+  
+  while(!Serial.available());
+  char response = Serial.read();
+  
+  if(response == 'y' || response == 'Y') {
+    // Reset semua nilai kalibrasi
+    cal_data.accel_offset_x = 0;
+    cal_data.accel_offset_y = 0;
+    cal_data.accel_offset_z = 0;
+    cal_data.gyro_offset_x = 0;
+    cal_data.gyro_offset_y = 0;
+    cal_data.gyro_offset_z = 0;
+    cal_data.mag_offset_x = 0;
+    cal_data.mag_offset_y = 0;
+    cal_data.mag_offset_z = 0;
+    cal_data.mag_scale_x = 1.0;
+    cal_data.mag_scale_y = 1.0;
+    cal_data.mag_scale_z = 1.0;
+    cal_data.is_calibrated = false;
+    
+    // Hapus dari EEPROM
+    EEPROM.write(EEPROM_CALIBRATED_FLAG, 0);
+    
+    Serial.println("Data kalibrasi telah direset!");
+  } else {
+    Serial.println("Reset dibatalkan.");
+  }
+}
+
+void showCalibrationData() {
+  Serial.println("\n=== DATA KALIBRASI SAAT INI ===");
+  
+  if(!cal_data.is_calibrated) {
+    Serial.println("Status: BELUM DIKALIBRASI");
+    return;
+  }
+  
+  Serial.println("Status: SUDAH DIKALIBRASI");
+  Serial.println();
+  
+  Serial.println("Accelerometer Offset:");
+  Serial.print("X: "); Serial.print(cal_data.accel_offset_x * accel_scale, 4); Serial.println(" g");
+  Serial.print("Y: "); Serial.print(cal_data.accel_offset_y * accel_scale, 4); Serial.println(" g");
+  Serial.print("Z: "); Serial.print(cal_data.accel_offset_z * accel_scale, 4); Serial.println(" g");
+  
+  Serial.println("\nGyroscope Offset:");
+  Serial.print("X: "); Serial.print(cal_data.gyro_offset_x * gyro_scale, 4); Serial.println(" °/s");
+  Serial.print("Y: "); Serial.print(cal_data.gyro_offset_y * gyro_scale, 4); Serial.println(" °/s");
+  Serial.print("Z: "); Serial.print(cal_data.gyro_offset_z * gyro_scale, 4); Serial.println(" °/s");
+  
+  Serial.println("\nMagnetometer Offset:");
+  Serial.print("X: "); Serial.println(cal_data.mag_offset_x);
+  Serial.print("Y: "); Serial.println(cal_data.mag_offset_y);
+  Serial.print("Z: "); Serial.println(cal_data.mag_offset_z);
+  
+  Serial.println("\nMagnetometer Scale:");
+  Serial.print("X: "); Serial.println(cal_data.mag_scale_x, 4);
+  Serial.print("Y: "); Serial.println(cal_data.mag_scale_y, 4);
+  Serial.print("Z: "); Serial.println(cal_data.mag_scale_z, 4);
+}
+
+// Fungsi untuk menyimpan kalibrasi ke EEPROM
+void saveCalibration() {
+  EEPROM.put(EEPROM_ACCEL_OFFSET_X, cal_data.accel_offset_x);
+  EEPROM.put(EEPROM_ACCEL_OFFSET_Y, cal_data.accel_offset_y);
+  EEPROM.put(EEPROM_ACCEL_OFFSET_Z, cal_data.accel_offset_z);
+  EEPROM.put(EEPROM_GYRO_OFFSET_X, cal_data.gyro_offset_x);
+  EEPROM.put(EEPROM_GYRO_OFFSET_Y, cal_data.gyro_offset_y);
+  EEPROM.put(EEPROM_GYRO_OFFSET_Z, cal_data.gyro_offset_z);
+  EEPROM.put(EEPROM_MAG_OFFSET_X, cal_data.mag_offset_x);
+  EEPROM.put(EEPROM_MAG_OFFSET_Y, cal_data.mag_offset_y);
+  EEPROM.put(EEPROM_MAG_OFFSET_Z, cal_data.mag_offset_z);
+  EEPROM.put(EEPROM_MAG_SCALE_X, cal_data.mag_scale_x);
+  EEPROM.put(EEPROM_MAG_SCALE_Y, cal_data.mag_scale_y);
+  EEPROM.put(EEPROM_MAG_SCALE_Z, cal_data.mag_scale_z);
+  EEPROM.write(EEPROM_CALIBRATED_FLAG, 1);
+  
+  cal_data.is_calibrated = true;
+  
+  Serial.println("Data kalibrasi disimpan ke EEPROM.");
+}
+
+// Fungsi untuk memuat kalibrasi dari EEPROM
+void loadCalibration() {
+  if(EEPROM.read(EEPROM_CALIBRATED_FLAG) == 1) {
+    EEPROM.get(EEPROM_ACCEL_OFFSET_X, cal_data.accel_offset_x);
+    EEPROM.get(EEPROM_ACCEL_OFFSET_Y, cal_data.accel_offset_y);
+    EEPROM.get(EEPROM_ACCEL_OFFSET_Z, cal_data.accel_offset_z);
+    EEPROM.get(EEPROM_GYRO_OFFSET_X, cal_data.gyro_offset_x);
+    EEPROM.get(EEPROM_GYRO_OFFSET_Y, cal_data.gyro_offset_y);
+    EEPROM.get(EEPROM_GYRO_OFFSET_Z, cal_data.gyro_offset_z);
+    EEPROM.get(EEPROM_MAG_OFFSET_X, cal_data.mag_offset_x);
+    EEPROM.get(EEPROM_MAG_OFFSET_Y, cal_data.mag_offset_y);
+    EEPROM.get(EEPROM_MAG_OFFSET_Z, cal_data.mag_offset_z);
+    EEPROM.get(EEPROM_MAG_SCALE_X, cal_data.mag_scale_x);
+    EEPROM.get(EEPROM_MAG_SCALE_Y, cal_data.mag_scale_y);
+    EEPROM.get(EEPROM_MAG_SCALE_Z, cal_data.mag_scale_z);
+    
+    cal_data.is_calibrated = true;
+    Serial.println("Data kalibrasi dimuat dari EEPROM.");
+  } else {
+    // Set default values
+    cal_data.accel_offset_x = 0;
+    cal_data.accel_offset_y = 0;
+    cal_data.accel_offset_z = 0;
+    cal_data.gyro_offset_x = 0;
+    cal_data.gyro_offset_y = 0;
+    cal_data.gyro_offset_z = 0;
+    cal_data.mag_offset_x = 0;
+    cal_data.mag_offset_y = 0;
+    cal_data.mag_offset_z = 0;
+    cal_data.mag_scale_x = 1.0;
+    cal_data.mag_scale_y = 1.0;
+    cal_data.mag_scale_z = 1.0;
+    cal_data.is_calibrated = false;
+    
+    Serial.println("Tidak ada data kalibrasi. Gunakan nilai default.");
+  }
+}
+
+// Fungsi pembacaan sensor
+void readAccelerometer(int16_t* x, int16_t* y, int16_t* z) {
+  Wire.beginTransmission(MPU9250_ADDRESS);
+  Wire.write(ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU9250_ADDRESS, 6);
+  
+  *x = (Wire.read() << 8) | Wire.read();
+  *y = (Wire.read() << 8) | Wire.read();
+  *z = (Wire.read() << 8) | Wire.read();
+}
+
+void readGyroscope(int16_t* x, int16_t* y, int16_t* z) {
+  Wire.beginTransmission(MPU9250_ADDRESS);
+  Wire.write(GYRO_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU9250_ADDRESS, 6);
+  
+  *x = (Wire.read() << 8) | Wire.read();
+  *y = (Wire.read() << 8) | Wire.read();
+  *z = (Wire.read() << 8) | Wire.read();
+}
+
+bool readMagnetometer(int16_t* x, int16_t* y, int16_t* z) {
+  Wire.beginTransmission(AK8963_ADDRESS);
+  Wire.write(MAG_XOUT_L);
+  Wire.endTransmission(false);
+  Wire.requestFrom(AK8963_ADDRESS, 7);
+  
+  if(Wire.available() < 7) return false;
+  
+  *x = Wire.read() | (Wire.read() << 8);
+  *y = Wire.read() | (Wire.read() << 8);
+  *z = Wire.read() | (Wire.read() << 8);
+  Wire.read(); // ST2 register
+  
+  return true;
+}
+
+// Fungsi inisialisasi
+bool initMPU9250() {
+  uint8_t whoami = readByte(MPU9250_ADDRESS, WHO_AM_I);
+  if (whoami != 0x71) return false;
+  
+  writeByte(MPU9250_ADDRESS, PWR_MGMT_1, 0x80);
+  delay(100);
+  writeByte(MPU9250_ADDRESS, PWR_MGMT_1, 0x01);
+  delay(100);
+  writeByte(MPU9250_ADDRESS, ACCEL_CONFIG, 0x00);
+  writeByte(MPU9250_ADDRESS, GYRO_CONFIG, 0x00);
+  writeByte(MPU9250_ADDRESS, SMPLRT_DIV, 0x09);
+  writeByte(MPU9250_ADDRESS, CONFIG, 0x03);
+  writeByte(MPU9250_ADDRESS, ACCEL_CONFIG2, 0x03);
+  writeByte(MPU9250_ADDRESS, INT_PIN_CFG, 0x02);
+  delay(100);
+  
+  return true;
+}
+
+bool initMagnetometer() {
+  uint8_t whoami = readByte(AK8963_ADDRESS, 0x00);
+  if (whoami != 0x48) return false;
+  
+  writeByte(AK8963_ADDRESS, MAG_CNTL2, 0x01);
+  delay(100);
+  writeByte(AK8963_ADDRESS, MAG_CNTL1, 0x16);
+  delay(100);
+  
+  return true;
+}
+
+// Helper functions untuk I2C
+void writeByte(uint8_t address, uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+uint8_t readByte(uint8_t address, uint8_t reg) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(address, (uint8_t)1);
+  return Wire.read();
+}
